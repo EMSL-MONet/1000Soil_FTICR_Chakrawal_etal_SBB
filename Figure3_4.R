@@ -1,0 +1,399 @@
+
+
+
+# Helper packages
+library(dplyr)    # for data manipulation
+library(ggplot2)  # for awesome graphics
+library(modelsummary)
+
+# Feature engineering packages
+library(sjPlot)
+library(MuMIn)
+library(readxl) 
+library(performance)
+library(vip)      # variable importance
+library(patchwork)
+library(randomForest)
+
+df_raw0 = read.csv('processed_data/df_BG_ICR.csv')
+col_to_keep =c('WEOC_mean','CN_WEOM',
+               'mean_GWC','alpha_diversity','BiomeType')
+col_to_pretty <- c(
+  WEOC_mean = "DOM_conc",
+  CN_WEOM = "CN_ratio",
+  mean_GWC = "Soil_moisture",
+  alpha_diversity = "Alpha_diversity",
+  BiomeType = "BiomeType"
+)
+
+df_raw <- df_raw0 %>%
+  rename_with(~col_to_pretty[.], all_of(col_to_keep))
+
+
+
+library(purrr)  # To iterate over models efficiently
+
+# Assume df_raw is your full dataset
+
+col_to_keep_sets <- list(
+  c('Respiration', 'Total_Carbon_pct', 'DOM_conc', 'CN_ratio', 'Clay_pct', 'Soil_moisture', 'pH', 'Alpha_diversity', 'BiomeType'),
+  c('Respiration', 'Total_Carbon_pct', 'DOM_conc', 'CN_ratio', 'Soil_moisture', 'pH', 'Alpha_diversity', 'BiomeType'),
+  c('Respiration', 'Total_Carbon_pct', 'DOM_conc', 'CN_ratio', 'pH', 'Alpha_diversity', 'BiomeType'),
+  c('Respiration', 'Total_Carbon_pct', 'DOM_conc', 'CN_ratio', 'Alpha_diversity', 'BiomeType'),
+  c('Respiration', 'Total_Carbon_pct', 'DOM_conc', 'Alpha_diversity', 'BiomeType')
+)
+
+# Function to create and summarize models
+fit_and_summarize_models <- function(cols) {
+  df0 <- df_raw %>% dplyr::select(all_of(cols))
+  df0$BiomeType <- as.factor(df0$BiomeType)
+  df0$Respiration <- log10(df0$Respiration)
+  df <- df0 %>%
+    mutate(across(-c(Respiration, BiomeType), ~ datawizard::standardize(.x))) %>%
+    na.omit()
+  predictor_names <- setdiff(names(df), c("Respiration", "BiomeType"))
+  
+  interaction_formula <- paste("(", paste(predictor_names, collapse = " + "), ")^2")
+  
+  # Combine interaction and quadratic terms into one formula
+  full_formula <- paste("Respiration ~", interaction_formula)
+  
+  # Convert the formula from string to a formula object
+  formula_obj <- as.formula(full_formula)
+  
+  lm(lm_model <- lm(formula_obj, data = df))
+}
+
+# Fit all models by iterating over each set of columns
+models <- purrr::map(col_to_keep_sets, fit_and_summarize_models)
+
+# Create summary table using modelsummary
+modelsummary(models, fmt = 2, estimate = "{estimate} ({std.error}){stars}",
+             statistic = NULL, gof_omit = 'ICC|RMSE'
+             # output = "regression_table_R1.docx"
+             )
+
+# plot_models(models)
+
+# -----------
+# Compute AIC for each model
+model_aics <- purrr::map_dbl(models, AIC)
+
+# Identify the index of the model with the lowest AIC
+best_model_index <- which.min(model_aics)
+
+# Fit the model with the best AIC
+col_to_keep =col_to_keep_sets[[best_model_index]]
+
+df0 <- df_raw %>% dplyr::select(all_of(col_to_keep))
+df0 <- na.omit(df0)
+
+df0$BiomeType = as.factor(df0$BiomeType)
+
+df0$Respiration = log10(df0$Respiration)
+colSums(is.na(df0))
+
+df <- df0 %>%
+  mutate(across(-c(Respiration, BiomeType), ~ datawizard::standardize(.x)))
+
+
+
+# lm_model------------------------
+
+# Automatically create a formula for interaction and quadratic terms
+predictor_names <- setdiff(names(df), c("Respiration", "BiomeType"))
+interaction_formula <- paste("(", paste(predictor_names, collapse = " + "), ")^2")
+
+# Combine interaction and quadratic terms into one formula
+full_formula <- paste("Respiration ~", interaction_formula)
+
+# Convert the formula from string to a formula object
+formula_obj <- as.formula(full_formula)
+
+# Fit the linear model using the generated formula object
+# formula_obj = formula('Respiration ~ DOM_conc + WETN_mean + Soil_moisture + Alpha_diversity + 
+#   DOM_conc:Alpha_diversity + WETN_mean:Alpha_diversity + Soil_moisture:Alpha_diversity')
+
+lm_model <- lm(formula_obj, data = df)
+summary(lm_model)
+
+# refine lm_model
+lm_model.1 =update(lm_model, .~.  
+                   -Total_Carbon_pct:pH 
+                   -DOM_conc:pH
+                   -DOM_conc:CN_ratio 
+                   -Total_Carbon_pct:CN_ratio)
+summary(lm_model.1)
+
+AIC(lm_model, lm_model.1)
+anova(lm_model.1, lm_model)
+
+lm_model.2 =update(lm_model.1, .~.  
+                   -pH:Alpha_diversity)
+summary(lm_model.2)
+
+AIC(lm_model.2, lm_model.1)
+anova(lm_model.2, lm_model.1)
+
+
+formula(lm_model.2)
+
+models.1 <- c(models, list(lm_model.2))
+# Create summary table using modelsummary
+modelsummary(models.1, fmt = 2, estimate = "{estimate} ({std.error}){stars}",
+             statistic = NULL, gof_omit = 'ICC|RMSE'
+)
+# Create summary table using modelsummary
+modelsummary(models.1, fmt = 2, estimate = "{estimate} ({std.error}){stars}",
+             statistic = NULL, gof_omit = 'ICC|RMSE',
+             output = "figs/SI/regression_table_R1.docx"
+)
+
+lm_model=lm_model.2
+# Function to create interaction plots for two predictors
+create_interaction_plot <- function(lm_model, data, predictor1, predictor2,
+                                    predictor1_lab, predictor2_lab, levels = NULL) {
+  num_points = 100
+  # Extract the names of the predictors from the lm_model
+  predictor_names <- all.vars(formula(lm_model))[2:length(all.vars(formula(lm_model)))]
+  
+  # Create sequences for predictors
+  predictor1_seq <- seq(min(data[[predictor1]]), max(data[[predictor1]]), length.out = num_points)
+  
+  # Set levels for predictor2 if no specific levels are provided
+  if (is.null(levels)) {
+    levels <- quantile(data[[predictor2]], probs = c(0.05,0.25,0.5,0.75,0.95))
+  }
+  
+  # Prepare a data frame for predictions, fixing all other predictors at their mean
+  prediction_data <- expand.grid(
+    predictor1 = predictor1_seq,
+    predictor2 = levels
+  )
+  
+  # Add fixed mean values for other predictors
+  for (other_var in setdiff(predictor_names, c(predictor1, predictor2))) {
+    prediction_data[[other_var]] <- mean(data[[other_var]])
+  }
+  
+  # Rename columns back to appropriate names
+  names(prediction_data)[1:2] <- c(predictor1, predictor2)
+  
+  # Predict Respiration based on the lm_model
+  prediction_data$Respiration <- predict(lm_model, newdata = prediction_data)
+  ylab <- expression(atop("Predicted Respiration", "[" * log[10] * "(mg C-CO"[2] * " g"^{-1} ~ "soil day"^{-1} * ")]"))
+  
+  predictor2_legend <- format(levels, digits = 2)
+
+  # Plot interaction effect with WEOC_mean on x-axis, no legend
+  interaction_plot <- ggplot(prediction_data, aes_string(x = predictor1, y = "Respiration",
+                                         color = paste0("as.factor(", predictor2, ")"))) +
+    geom_line(linewidth = 1) +
+    geom_rug(data = df, aes_string(x = predictor1), sides = "b", color = "gray") +
+    labs(
+      x = predictor1_lab,
+      y = ylab,
+      color = predictor2_lab
+    ) +
+    scale_color_manual(values = scales::hue_pal()(length(predictor2_legend)),
+                       labels = predictor2_legend,
+                       guide = guide_legend(ncol = 5)) +  # Format legend labels
+    theme_minimal()+
+    theme(
+      legend.position = c(0.7, 0.2),
+      panel.background = element_rect(fill = "white", color = "NA"),  # Set plot panel background
+      plot.background = element_rect(fill = "white", color = "NA"),    # Set overall plot background
+      axis.text.y = element_text(size = 12, color = "black"),
+      axis.text.x = element_text(size = 12, color = "black"),
+    )+
+    ylim(c(-3,1))
+  return(interaction_plot)
+}
+
+
+predictor1 = "Alpha_diversity"
+predictor2 = "DOM_conc"
+
+predictor1_lab="Alpha Diversity"
+predictor2_lab = "DOM concentration"
+
+# Assuming create_interaction_plot returns ggplot objects
+p1 <- create_interaction_plot(lm_model, df, "Alpha_diversity", "DOM_conc", predictor1_lab, predictor2_lab, levels = c(-1, 0, 1, 2,3))+
+  ggtitle("(A)") 
+p2 <- create_interaction_plot(lm_model, df, "Alpha_diversity", "Total_Carbon_pct", predictor1_lab, "Total C (%)", levels = c(-1, 0, 1, 2, 3)) +
+  # theme(axis.title.y = element_blank(),legend.position = c(0.8, 0.2))+
+  ggtitle("(B)")   # Remove y-axis label
+p3 <- create_interaction_plot(lm_model, df, "DOM_conc", "Total_Carbon_pct", predictor2_lab, "Total C (%)", levels = c(-1, 0, 1, 2, 3)) +
+  # theme(axis.title.y = element_blank(),legend.position = c(0.8, 0.2))+  # Remove y-axis label
+  ggtitle("(C)")
+  
+
+# Combine plots into one layout with three columns
+comb_plot <- p1 + p2 + p3 + plot_layout(ncol = 1)
+
+# Print combined plot
+print(comb_plot)
+# Save the combined plot ----------------
+ggsave(filename = "figs/figure4.png",  # Output file name
+       plot = comb_plot,            # Plot object
+       width = 6,                       # Width in inches
+       height = 9,                      # Height in inches
+       dpi = 600,                       # Resolution in dpi
+       units = "in")                    # Units (inches)
+
+p1 <- create_interaction_plot(lm_model, df, "Alpha_diversity", "DOM_conc", predictor1_lab, predictor2_lab, levels = c(-2, -1, 0, 1, 2))
+# ggsave(filename = "figure4.png",  # Output file name
+#        plot = p1,            # Plot object
+#        width = 5,                       # Width in inches
+#        height = 3.5,                      # Height in inches
+#        dpi = 600,                       # Resolution in dpi
+#        units = "in")                    # Units (inches)
+
+# Cross-validation for linear model------------------------
+library(caret)
+set.seed(123)  # for reproducibility
+cv_model1 <- train(
+  form = formula(lm_model),
+  data = df,
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 5)
+)
+resamples <- cv_model1$resample$Rsquared
+mean(resamples)
+sd(resamples)
+boxplot(resamples)
+
+
+
+
+
+
+# randomForest------------------------
+
+# Set seed for reproducibility
+set.seed(123)
+
+col_to_keep =col_to_keep_sets[[2]]
+
+df0 <- df_raw %>% dplyr::select(all_of(col_to_keep))
+df0 <- na.omit(df0)
+
+df0$BiomeType = as.factor(df0$BiomeType)
+
+# df0$Respiration = log10(df0$Respiration)
+
+# Fit Random Forest model
+rf_model <- randomForest(Respiration ~ ., data = df0, importance = TRUE, ntree = 500)
+
+# Extract and plot feature importance
+importance_df <- data.frame(Feature = rownames(importance(rf_model)), 
+                            Importance = importance(rf_model)[, 1])  # %IncMSE importance
+
+# Plot feature importance
+library(ggplot2)
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Feature Importance from Random Forest",
+       x = "Feature", y = "% Increase in MSE")
+
+
+# Extract summary to get p-values
+lm_summary <- summary(lm_model)
+# Create a dataframe for coefficients and p-values
+lm_importance_df <- data.frame(
+  Feature = names(coef(lm_model)),
+  Coefficient = coef(lm_model),
+  P_value = lm_summary$coefficients[, "Pr(>|t|)"],
+  Significant = lm_summary$coefficients[, "Pr(>|t|)"] < 0.05  # Add a significance column
+)
+
+# Filter out intercept
+lm_importance_df <- lm_importance_df %>% 
+  filter(Feature != "(Intercept)")
+
+# Fit Random Forest Model
+set.seed(123)
+rf_model <- randomForest(Respiration ~ ., data = df0, importance = TRUE, ntree = 500)
+
+# Extract feature importance from RF
+rf_importance_df <- data.frame(Feature = rownames(importance(rf_model)),
+                               Importance = importance(rf_model)[, 1])  # %IncMSE
+
+
+# Calculate R-squared for the linear model
+r_squared_lm <- summary(lm_model)$r.squared
+
+# Calculate R-squared for the random forest model using pseudo R-squared
+# Random Forest doesn't provide R-squared directly. It's common to use %Var explained.
+# Here we use variance explained or pseudo R-squared approximation techniques for demonstration.
+rf_pred <- predict(rf_model, df0)
+ss_total <- sum((df0$Respiration - mean(df0$Respiration))^2)
+ss_residual <- sum((df0$Respiration - rf_pred)^2)
+r_squared_rf <- 1 - (ss_residual / ss_total)
+
+
+
+# Plot Linear Regression Coefficients with indication for significance
+p1 <- ggplot(lm_importance_df, aes(x = reorder(Feature, Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity", aes(fill = Significant), alpha = 0.8) +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("TRUE" = "#bbca72", "FALSE" = "gray"), 
+                    guide = guide_legend(title = "Significant"),) +  # Blue for significant, Gray for non-significant
+  theme(legend.position = c(0.8, 0.5),
+        axis.text.y = element_text(size = 14, color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 14)) +  # Adjust legend position with numeric coordinates
+  labs(title = "(A)", x = "", y = "Coefficient", )+
+  annotate("text", x = 1, 
+           y = min(lm_importance_df$Coefficient) * -0.92, 
+           label = paste("R² =", round(r_squared_lm, 2)), 
+           size = 5, color = "black", fontface = "bold", hjust = 0)
+  # annotate("text", x = 0.4, y = 5, label = paste("R² = ", round(r_squared_lm, 2)), 
+  #          size = 5, color = "black", fontface = "bold")
+
+
+# Plot Random Forest Feature Importance
+percent_var_explained <- round(100 * rf_model$rsq[length(rf_model$rsq)], 2)
+p2 <- ggplot(rf_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#494844", alpha = 0.8) +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 14, color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 14))+
+  labs(title = "(B)", x = "", y = "% Increase in MSE")+
+  annotate("text", x = 1.5, 
+           y = min(rf_importance_df$Importance)*5 , 
+           label = paste("% Var explained =", round(percent_var_explained, 2)), 
+           size = 5, color = "black", hjust = 0) +
+  annotate("text", x = 0.75, 
+           y = min(rf_importance_df$Importance) * 5, 
+           label = paste("R² =", round(r_squared_rf, 2)), 
+           size = 5, color = "black", fontface = "bold", hjust = 0)
+
+# Save the combined plot ------------------------------------------
+# Combine both plots into a two-column figure
+comb_plot= p1 + p2 + plot_layout(ncol = 2)
+comb_plot
+ggsave(filename = "figs/figure3.png",  # Output file name
+       plot = comb_plot,            # Plot object
+       width = 12,                       # Width in inches
+       height = 6,                      # Height in inches
+       dpi = 600,                       # Resolution in dpi
+       units = "in")                    # Units (inches)
+
+ggsave(filename = "figs/figure3.svg",  # Output file name
+       plot = comb_plot,            # Plot object
+       width = 12,                       # Width in inches
+       height = 6,                      # Height in inches
+       units = "in")                    # Units (inches)
+
+
+
+
+
